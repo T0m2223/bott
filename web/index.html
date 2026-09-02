@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>chessbot</title>
+<style>
+  :root { --bg:#14181d; --panel:#1c232b; --line:#2c3744; --text:#e8e8e8;
+          --muted:#8f9aa8; --gold:#ffc66d; --light:#f0d9b5; --dark:#b58863;
+          --sel:#ffd54f; --from:#fff176; --target:#7cc46f; --check:#e53935; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font-family: system-ui, -apple-system, sans-serif;
+         -webkit-tap-highlight-color: transparent; }
+  #wrap { max-width: 940px; margin: 0 auto; padding: 18px;
+          display: flex; gap: 26px; flex-wrap: wrap; }
+  .col { flex:1; min-width: 300px; }
+  .bar { display:flex; gap:8px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
+  button, select {
+    background:#232b35; color:var(--text); border:1px solid var(--line);
+    border-radius:6px; padding:8px 14px; cursor:pointer; font-size:15px;
+  }
+  button:hover { background:#2e3a48; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .clock { font-variant-numeric: tabular-nums; font-weight:600; color:var(--gold); }
+  #board { width:min(480px, 96vw); aspect-ratio:1; display:grid;
+           grid-template-columns:repeat(8, 1fr); grid-template-rows:repeat(8, 1fr);
+           border:2px solid var(--line); border-radius:8px; overflow:hidden;
+           touch-action: manipulation; }
+  .sq { aspect-ratio:1; min-width:0; min-height:0; line-height:1;
+        display:flex; align-items:center; justify-content:center;
+        position:relative; cursor:pointer; user-select:none; -webkit-user-select:none;
+        -webkit-touch-callout:none; touch-action: manipulation;
+        font-size:min(46px, 10vw); }
+  .sq.light { background:var(--light); } .sq.dark { background:var(--dark); }
+  .sq.selected { background:#ffe082 !important; }
+  .sq.target::after { content:""; position:absolute; inset:0; margin:auto;
+        width:18%; height:18%; border-radius:50%; background:#2e8b57;
+        opacity:.75; pointer-events:none; }
+  .sq.capture { box-shadow: inset 0 0 0 4px var(--target); }
+  .sq.check { background:#ff8a80 !important; }
+  .sq.wp { color:#ffffff; text-shadow:0 0 1px #000, 0 1px 2px rgba(0,0,0,.9); }
+  .sq.bp { color:#000000; text-shadow:0 0 2px #fff, 0 1px 2px rgba(0,0,0,.5); }
+  #status { font-size:15px; margin:10px 0 6px; min-height:24px; }
+  #err { color:#ff7b72; min-height:18px; font-size:12px; }
+  #moves { background:var(--panel); border:1px solid var(--line); border-radius:6px;
+           padding:8px 10px; height:210px; overflow-y:auto; font-size:13px;
+           line-height:1.7; }
+  #moves b { color:var(--gold); }
+  #fen { word-break:break-all; font-family:ui-monospace, monospace; font-size:11px;
+         color:var(--muted); margin-top:8px; }
+  label.tog { font-size:13px; color:var(--muted); }
+  #promo { display:none; position:fixed; left:0; right:0; top:0; bottom:0;
+           background:rgba(0,0,0,.55); z-index:50; align-items:center;
+           justify-content:center; }
+  #promo .box { background:var(--panel); border:1px solid var(--line);
+                border-radius:10px; padding:16px; text-align:center; }
+  #promo button { font-size:34px; padding:6px 14px; margin:4px; min-width:60px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div class="col">
+    <div class="bar">
+      <button id="newBtn">New game</button>
+      <span style="color:var(--muted)">you play White · the bot plays Black</span>
+    </div>
+    <div class="bar">
+      <span>Bot clock</span> <span class="clock" id="clock">--:--</span>
+    </div>
+    <div id="board"></div>
+  </div>
+  <div class="col">
+    <div id="status">Starting…</div>
+    <div id="err"></div>
+    <div id="moves"></div>
+    <div id="fen"></div>
+  </div>
+</div>
+<div id="promo"><div class="box" id="promoBox"></div></div>
+
+<script>
+(function () {
+  "use strict";
+  var GLYPH = {K:"\u265A",Q:"\u265B",R:"\u265C",B:"\u265D",N:"\u265E",P:"\u265F",
+               k:"\u265A",q:"\u265B",r:"\u265C",b:"\u265D",n:"\u265E",p:"\u265F"};
+
+  var boardEl  = document.getElementById("board");
+  var statusEl = document.getElementById("status");
+  var errEl    = document.getElementById("err");
+  var movesEl  = document.getElementById("moves");
+  var fenEl    = document.getElementById("fen");
+  var clockEl  = document.getElementById("clock");
+  var promoEl  = document.getElementById("promo");
+  var promoBox = document.getElementById("promoBox");
+
+  var fen = "", human = "w", orientation = "white";  // human is ALWAYS White
+  var turn = "w";          // side to move, always taken from the server response
+  var botMs = 5 * 60 * 1000;
+  var BOT_TIMEOUT = 30000; // hard cap so "thinking" can never hang forever
+  var board = [];          // 64 cells: piece char (uppercase=white) or ""
+  var legal = [];          // cached {from,to,promotion,san}
+  var selected = null;     // coord string of selected piece
+  var checkSquare = null;  // coord of the king in check
+  var history = [];        // {san, byHuman}
+  var busy = false, gameOver = false;
+
+  function sideName(c){ return c === "w" ? "White" : "Black"; }
+  function fenTurn(){ return fen.split(" ")[1] === "w" ? "w" : "b"; }
+  function syncTurn(d) {          // server is authoritative; FEN is fallback
+    var t = d && d.turn;
+    if (t === "white") turn = "w";
+    else if (t === "black") turn = "b";
+    else turn = fenTurn();
+  }
+  function humanTurn(){ return !gameOver && !busy && turn === human; }
+  function fmt(ms){ ms=Math.max(0,Math.round(ms));
+    var m=Math.floor(ms/60000), s=Math.floor((ms%60000)/1000);
+    return (m<10?"0":"")+m+":"+(s<10?"0":"")+s; }
+
+  // ---------- FEN / board ----------
+  function parseFen(f) {
+    var rows = f.split(" ")[0].split("/"), cells = [];
+    for (var r=0; r<8; r++) {
+      for (var c=0; c<rows[r].length; c++) {
+        var ch = rows[r][c];
+        if (ch >= "1" && ch <= "8") { for (var k=0;k<+ch;k++) cells.push(""); }
+        else cells.push(ch);
+      }
+    }
+    board = cells;
+  }
+  function idxOf(coord) {
+    var file = coord.charCodeAt(0)-97, rank = +coord[1]-1;
+    return orientation === "white" ? (7-rank)*8+file : rank*8+(7-file);
+  }
+  function coordAt(i) {
+    var f = i%8, rr = (i-f)/8;
+    return String.fromCharCode(97+(orientation==="white"?f:7-f)) +
+           ((orientation==="white"?7-rr:rr)+1);
+  }
+  function pieceColor(coord) {
+    var p = board[idxOf(coord)];
+    return p ? (p === p.toUpperCase() ? "w" : "b") : null;
+  }
+  function render() {
+    var html = "";
+    for (var i=0; i<64; i++) {
+      var coord = coordAt(i), pc = board[i];
+      var cls = (i + Math.floor(i/8)) % 2 === 1 ? "dark" : "light";
+      var isSel = selected === coord;
+      var isTarget = selected !== null && !isSel && legal.some(function (m) {
+        return m.from === selected && m.to === coord;
+      });
+      if (isSel) cls += " selected";
+      else if (isTarget) cls += pc ? " capture" : " target";
+      if (checkSquare === coord) cls += " check";
+      if (pc) cls += pieceColor(coord) === "w" ? " wp" : " bp";
+      html += '<div class="sq '+cls+'" data-coord="'+coord+'">'+
+              (pc ? GLYPH[pc] : "")+"</div>";
+    }
+    boardEl.innerHTML = html;
+  }
+
+  // ---------- server ----------
+  function api(method, url, body, timeoutMs) {
+    var controller = (typeof AbortController !== "undefined") ?
+                     new AbortController() : null;
+    var timer = timeoutMs ? setTimeout(function () {
+      if (controller) controller.abort();
+    }, timeoutMs) : null;
+    var opts = { method: method, headers: {"Content-Type":"application/json"} };
+    if (body) opts.body = JSON.stringify(body);
+    if (controller) opts.signal = controller.signal;
+    return fetch(url, opts).then(function (r) {
+      return r.json().then(function (d) {
+        if (!r.ok) { var e = new Error(d.error || ("HTTP "+r.status)); e.data = d; throw e; }
+        return d;
+      });
+    }).finally(function () {
+      if (timer) clearTimeout(timer);
+    });
+  }
+  function refreshLegal() {
+    return api("GET", "/api/legal?fen="+encodeURIComponent(fen)).then(function (d) {
+      legal = d.moves;
+      gameOver = d.game.over;
+      syncTurn(d);
+      var k = (d.game.check ? kingCoord() : null);
+      checkSquare = k;
+    });
+  }
+  function kingCoord() {
+    var target = turn === "w" ? "K" : "k";
+    for (var i=0; i<64; i++) if (board[i] === target) return coordAt(i);
+    return null;
+  }
+
+  // ---------- human moves ----------
+  var tapCoord = null, upInfo = null;
+  function handleTap(el) {
+    if (!humanTurn()) return;
+    var coord = el.getAttribute("data-coord");
+    var pc = pieceColor(coord);
+    if (pc === human) {              // select / re-select own piece
+      selected = coord;
+      render();
+      return;
+    }
+    if (selected) {
+      var mv = legal.find(function (m) {
+        return m.from === selected && m.to === coord;
+      });
+      if (mv) {
+        if (mv.promotion) { showPromo(selected, coord); return; }
+        playMove(selected, coord, null);
+        return;
+      }
+    }
+    selected = null;
+    render();
+  }
+  boardEl.addEventListener("pointerdown", function (ev) {
+    var el = ev.target.closest(".sq");
+    tapCoord = el ? el.getAttribute("data-coord") : null;
+  });
+  boardEl.addEventListener("pointerup", function (ev) {
+    var el = ev.target.closest(".sq");
+    if (!el || !tapCoord) return;
+    if (el.getAttribute("data-coord") === tapCoord) {
+      upInfo = { coord: tapCoord, at: Date.now() };
+      handleTap(el);
+    }
+  });
+  boardEl.addEventListener("click", function (ev) {  // fallback for no-PointerEvent browsers
+    var el = ev.target.closest(".sq");
+    if (!el) return;
+    var coord = el.getAttribute("data-coord");
+    if (upInfo && upInfo.coord === coord && Date.now() - upInfo.at < 500) return;
+    upInfo = { coord: coord, at: Date.now() };
+    handleTap(el);
+  });
+
+  function refreshAll() {
+    parseFen(fen);
+    renderMoves();
+    refreshLegal().then(function () {   // sets turn/gameOver from the server
+      render();
+      setStatus();
+    });
+  }
+
+  // Apply a server position response (from /api/play or /api/best_move) in a
+  // single step: fen, turn, game, and the legal move list all arrive together,
+  // so the board never waits on a second /api/legal round trip.
+  function applyResponse(d) {
+    fen = d.fen;
+    lastGame = d.game;
+    syncTurn(d);
+    gameOver = !!d.game.over;
+    legal = d.legal || [];
+    checkSquare = d.game.check ? kingCoord() : null;
+    parseFen(fen);
+    renderMoves();
+    selected = null;
+    render();
+    setStatus();
+  }
+
+  // The ONLY place the bot is ever invoked is right after the human's move is
+  // played. There is no other code path that can ask the bot to move.
+  function playMove(from, to, promo) {
+    var before = fen;
+    busy = true; selected = null; render();
+    api("POST", "/api/play", { fen: before, from: from, to: to, promotion: promo })
+      .then(function (d) {
+        history.push({ san: d.san, byHuman: true });
+        busy = false;
+        applyResponse(d);
+        if (turn === "b" && !gameOver) askBot();
+      })
+      .catch(function (e) {
+        errEl.textContent = "play: "+e.message;
+        busy = false; selected = null;
+        refreshAll();
+      });
+  }
+
+  function showPromo(from, to) {
+    // solid glyphs for both colours, matching the board pieces
+    var glyphs = { q: [0x265B, 0x265B], r: [0x265C, 0x265C],
+                   b: [0x265D, 0x265D], n: [0x265E, 0x265E] };
+    promoBox.innerHTML = "Promote to:<br>" +
+      ["q","r","b","n"].map(function (k) {
+        var g = String.fromCharCode(glyphs[k][turn === "w" ? 0 : 1]);
+        return '<button data-p="'+k+'">'+g+"</button>";
+      }).join("");
+    promoEl.style.display = "flex";
+    promoBox.onclick = function (ev) {
+      var b = ev.target.closest("button");
+      if (!b) return;
+      promoEl.style.display = "none";
+      playMove(from, to, b.getAttribute("data-p"));
+    };
+  }
+
+  // ---------- bot ----------
+  // Explicitly guarded: the bot may only move when it is Black's turn.
+  function askBot() {
+    if (busy || gameOver || turn !== "b") return;
+    busy = true; selected = null;
+    var before = fen, t0 = performance.now();
+    statusEl.textContent = "Bot is thinking…";
+    render();
+    api("POST", "/api/best_move",
+        { fen: before, time_left_ms: Math.max(1, Math.round(botMs)) },
+        BOT_TIMEOUT)
+      .then(function (d) {
+        botMs -= Math.round(performance.now() - t0);
+        clockEl.textContent = fmt(botMs);
+        history.push({ san: d.san, byHuman: false });
+        busy = false;
+        applyResponse(d);
+      })
+      .catch(function (e) {
+        errEl.textContent = "bot: "+e.message;
+        busy = false;
+        refreshAll();
+      });
+  }
+
+  // ---------- UI ----------
+  var lastGame = null;
+  function setStatus() {
+    if (gameOver) {
+      if (lastGame && lastGame.over) {
+        var t = (lastGame.winner ? sideName(lastGame.winner)+" win by "
+                                 : "Draw - ") + lastGame.reason;
+        statusEl.textContent = t + "   ("+lastGame.result+")";
+      } else {
+        statusEl.textContent = "Game over.";
+      }
+      return;
+    }
+    statusEl.textContent = (checkSquare ? "Check!  " : "") +
+      (turn === human
+        ? "Your move ("+sideName(human)+")."
+        : "Bot ("+sideName(turn)+") to move.");
+  }
+  function renderMoves() {
+    var html = "", num = 0;
+    for (var i=0; i<history.length; i++) {
+      var h = history[i];
+      if (i % 2 === 0) { html += (num+1)+". "; num++; }
+      html += h.byHuman ? h.san : "<b>"+h.san+"</b>";
+      html += (i % 2 === 1) ? "<br>" : "  ";
+    }
+    movesEl.innerHTML = html || "<i>no moves yet</i>";
+    movesEl.scrollTop = movesEl.scrollHeight;
+    fenEl.textContent = fen;
+  }
+
+  function startGame() {
+    selected = null; legal = []; history = [];
+    gameOver = false; busy = false; checkSquare = null; turn = "w";
+    lastGame = null;
+    errEl.textContent = "";
+    fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+    parseFen(fen);
+    renderMoves();
+    clockEl.textContent = fmt(botMs);
+    refreshLegal().then(function () {
+      render();
+      setStatus();
+    });
+  }
+
+  document.getElementById("newBtn").addEventListener("click", startGame);
+
+  fetch("/api/health").then(function (r) { return r.json(); }).then(function (h) {
+    if (h.ok && h.clock_ms) { botMs = h.clock_ms; }
+    startGame();
+  }).catch(function () { startGame(); });
+})();
+</script>
+</body>
+</html>
